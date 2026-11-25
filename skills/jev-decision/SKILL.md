@@ -1,6 +1,6 @@
 ---
 name: jev-decision
-description: Decide, choose, classify, rank, score, or judge yes/no with Jev before deliberating. Use for 결정, 선택, 분류, 우선순위, 점수, 충족 여부 판단 when the answer changes the next action and the state fits in about 150 words. TypeSafe-only; no fallback source.
+description: Decide, choose, classify, rank, score, or judge yes/no with Jev, in batches. Use for 결정, 선택, 분류, 우선순위, 점수, 충족 여부 판단 when one call settles at least 5 judgments of the same kind, or when the alternative deliberation would run long. TypeSafe-only; no fallback source.
 license: MIT
 compatibility: Requires Python 3 and a TypeSafe API key (no third-party packages)
 metadata:
@@ -14,7 +14,7 @@ allowed-tools:
 
 Use Jev when an agent needs a small, well-scoped judgment that a typed answer can replace with less reasoning. Jev is a TypeSafe System One decision model, not a chat, summarization, or code-generation model: it returns typed values and probabilities instead of generated text.
 
-Before writing a long deliberation, check two conditions. Call Jev when both hold: (a) the answer changes the next action (a branch, a classification, an accept/reject), and (b) the relevant state fits in roughly 150 words built from the option set and the decisive facts. If unsure whether a case qualifies, call it; a few small calls per session is normal.
+Before writing a long deliberation, check whether a Jev call pays off. Call Jev when one request settles at least 5 judgments of the same kind, or when the alternative deliberation would run past roughly 1,000 output tokens. A single quick judgment is cheaper to answer directly: a measured Jev round-trip cost about 24k conversation tokens on 2026-11-26 (skill load plus a full-context resend per tool turn) while replacing only 30-300 tokens of answer. Batch related questions instead of making one call per decision.
 
 ## Good fits
 
