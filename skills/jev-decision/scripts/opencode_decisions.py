@@ -1,28 +1,48 @@
 #!/usr/bin/env python3
-"""Make typed Jev decisions through OpenCode's connected provider account."""
+"""Make typed Jev decisions through TypeSafe's systemone API."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import re
-import shutil
-import subprocess
+import os
 import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 
-API_PATH = "/api/experimental/generate/decisions"
-PROVIDER_ID = "opencode"
-FREE_MODEL = "jev-1.13-free"
-PAID_MODEL = "jev-1.13"
-FALLBACK_STATUSES = {408, 410, 425, 429, 422}
+TYPESAFE_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
+TYPESAFE_MODEL = "jev-latest"
+TYPESAFE_KEY_ENV = "TYPESAFE_API_KEY"
+TYPESAFE_KEY_FILE = Path.home() / ".config" / "opencode" / "jev-decision" / "typesafe_key"
+USAGE_LOG = Path.home() / ".local" / "state" / "jev" / "usage.jsonl"
 
 
 class RequestFailure(Exception):
-    def __init__(self, message: str, fallbackable: bool) -> None:
-        super().__init__(message)
-        self.fallbackable = fallbackable
+    """A request failed. There is no fallback source by design."""
+
+
+def _question_types(payload: dict[str, Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for question in payload.get("questions", {}).values():
+        name = question.get("type") if isinstance(question, dict) else None
+        if isinstance(name, str):
+            counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def _log_usage(record: dict[str, Any]) -> None:
+    """Append one metadata-only line per call. Never stores state or question text."""
+    try:
+        USAGE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with USAGE_LOG.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
 
 
 def _choice_list(criteria: Any, question_id: str) -> list[dict[str, Any]]:
@@ -56,7 +76,8 @@ def _score_levels(criteria: Any, question_id: str) -> list[dict[str, str]]:
     return levels
 
 
-def to_opencode_request(payload: Any, model_id: str) -> dict[str, Any]:
+def to_typesafe_request(payload: Any, model_id: str) -> dict[str, Any]:
+    """Validate the shared input shape and build a native TypeSafe systemone request."""
     if not isinstance(payload, dict):
         raise ValueError("Input must be a JSON object.")
     state = payload.get("state")
@@ -66,134 +87,231 @@ def to_opencode_request(payload: Any, model_id: str) -> dict[str, Any]:
     if not isinstance(questions, dict) or not questions:
         raise ValueError("Input must include a non-empty 'questions' object.")
 
-    if isinstance(state, str):
-        input_parts = [{"type": "text", "text": state}]
-    else:
-        input_parts = [{"type": "json", "value": state}]
-
-    native_questions = []
+    native_questions: dict[str, Any] = {}
     for question_id, question in questions.items():
         if not isinstance(question, dict) or not isinstance(question.get("instructions"), str):
             raise ValueError(f"Question {question_id!r} needs an instructions string.")
         instructions = question["instructions"]
         question_type = question.get("type")
-        native: dict[str, Any] = {"name": question_id, "instructions": instructions}
 
         if question_type == "choice":
-            native.update({"type": "choice", "choices": _choice_list(question.get("criteria"), question_id)})
+            criteria = {
+                item["value"]: item["description"] for item in _choice_list(question.get("criteria"), question_id)
+            }
+            native_questions[question_id] = {
+                "type": "choice",
+                "instructions": instructions,
+                "criteria": criteria,
+            }
         elif question_type == "score":
-            native.update({"type": "score", "levels": _score_levels(question.get("criteria"), question_id)})
+            levels: list[Any] = []
+            for level in _score_levels(question.get("criteria"), question_id):
+                if "description" in level:
+                    levels.append(level)
+                else:
+                    levels.append(level["label"])
+            native_questions[question_id] = {
+                "type": "score",
+                "instructions": instructions,
+                "criteria": levels,
+            }
         elif question_type == "noul":
-            # OpenCode calls a probability-of-truth question a predicate.
             criteria = question.get("criteria")
             if criteria:
-                instructions += f"\nClarification: {criteria}"
-                native["instructions"] = instructions
-            native["type"] = "predicate"
+                instructions = f"{instructions}\nClarification: {criteria}"
+            native_questions[question_id] = {"type": "noul", "instructions": instructions}
         else:
             raise ValueError(f"Question {question_id!r} needs type choice, score, or noul.")
 
-        native_questions.append(native)
+    return {"model": model_id, "state": state, "questions": native_questions}
+
+
+def normalize_typesafe_response(response: dict[str, Any], question_ids: list[str]) -> dict[str, Any]:
+    """Convert TypeSafe answers into OpenCode's answer-list shape."""
+    raw_answers = response.get("answers")
+    if not isinstance(raw_answers, dict):
+        raise RequestFailure("TypeSafe response did not contain an answers object")
+
+    answers: list[dict[str, Any]] = []
+    for question_id in question_ids:
+        answer = raw_answers.get(question_id)
+        if not isinstance(answer, dict):
+            answers.append({"type": "error", "name": question_id, "reason": "no answer returned"})
+            continue
+        answer_type = answer.get("type")
+
+        if answer_type == "noul":
+            answers.append(
+                {"type": "predicate", "name": question_id, "probability": answer.get("noul")}
+            )
+        elif answer_type == "choice":
+            probabilities = answer.get("probabilities")
+            if not isinstance(probabilities, dict):
+                probabilities = {}
+            answers.append(
+                {
+                    "type": "choice",
+                    "name": question_id,
+                    "choice": answer.get("choice"),
+                    "probabilities": [
+                        {"value": value, "probability": probability}
+                        for value, probability in probabilities.items()
+                    ],
+                    "confidence": answer.get("confidence"),
+                }
+            )
+        elif answer_type == "score":
+            probabilities = answer.get("probabilities")
+            legend = answer.get("legend")
+            if not isinstance(probabilities, dict):
+                probabilities = {}
+            if not isinstance(legend, dict):
+                legend = {}
+            levels = []
+            for key, probability in probabilities.items():
+                label = legend.get(key, key)
+                if isinstance(label, dict) and isinstance(label.get("label"), str):
+                    label = label["label"]
+                elif not isinstance(label, str):
+                    label = json.dumps(label, ensure_ascii=False)
+                try:
+                    value: Any = int(key)
+                except (TypeError, ValueError):
+                    value = key
+                levels.append({"value": value, "label": label, "probability": probability})
+            answers.append(
+                {
+                    "type": "score",
+                    "name": question_id,
+                    "score": answer.get("score"),
+                    "probabilities": levels,
+                    "confidence": answer.get("confidence"),
+                }
+            )
+        else:
+            answers.append(
+                {"type": "error", "name": question_id, "reason": f"unsupported answer type {answer_type!r}"}
+            )
 
     return {
-        "model": {"providerID": PROVIDER_ID, "id": model_id},
-        "input": input_parts,
-        "questions": native_questions,
+        "data": {"answers": answers},
+        "model": response.get("model"),
+        "source": "typesafe",
+        "usage": response.get("usage"),
     }
 
 
-def _error_status(output: str) -> int | None:
-    match = re.search(r"\bHTTP\s+(\d{3})\b", output, re.IGNORECASE)
-    return int(match.group(1)) if match else None
-
-
-def request_jev(payload: dict[str, Any], model_id: str, timeout: float) -> dict[str, Any]:
-    executable = shutil.which("opencode")
-    if not executable:
-        raise RequestFailure("OpenCode CLI was not found on PATH", False)
-
-    data = json.dumps(to_opencode_request(payload, model_id), ensure_ascii=False)
+def _typesafe_key() -> str | None:
+    key = os.environ.get(TYPESAFE_KEY_ENV, "").strip()
+    if key:
+        return key
     try:
-        result = subprocess.run(
-            [executable, "api", "post", API_PATH, "--data", data],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        raise RequestFailure("OpenCode decision request timed out", True) from None
-    except OSError as error:
-        raise RequestFailure(f"could not run OpenCode CLI ({type(error).__name__})", False) from None
+        key = TYPESAFE_KEY_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return key or None
 
-    if result.returncode != 0:
-        combined = f"{result.stdout}\n{result.stderr}"
-        status = _error_status(combined)
-        fallbackable = (
-            status in FALLBACK_STATUSES
-            or (status is not None and status >= 500)
-            or status in {404}
-            or any(word in combined.lower() for word in ("timeout", "timed out", "unavailable", "rate limit"))
-        )
-        safe_detail = f"HTTP {status}" if status is not None else "OpenCode API request failed"
-        raise RequestFailure(safe_detail, fallbackable)
+
+def _typesafe_hint(status: int) -> str:
+    if status in {401, 403}:
+        return f"HTTP {status} (check {TYPESAFE_KEY_ENV} or {TYPESAFE_KEY_FILE})"
+    if status == 402:
+        return "HTTP 402 (check the TypeSafe balance)"
+    if status == 429:
+        return "HTTP 429 (rate limited)"
+    if status >= 500:
+        return f"HTTP {status} (TypeSafe service error)"
+    return f"HTTP {status}"
+
+
+def request_typesafe(payload: dict[str, Any], model_id: str, key: str, timeout: float) -> dict[str, Any]:
+    request = to_typesafe_request(payload, model_id)
+    body = json.dumps(request, ensure_ascii=False).encode("utf-8")
+    http_request = urllib.request.Request(
+        TYPESAFE_ENDPOINT,
+        data=body,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(http_request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8")
+    except urllib.error.HTTPError as error:
+        raise RequestFailure(_typesafe_hint(error.code)) from None
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        raise RequestFailure(f"TypeSafe request failed ({type(error).__name__})") from None
 
     try:
-        response = json.loads(result.stdout)
+        parsed = json.loads(raw)
     except json.JSONDecodeError:
-        raise RequestFailure("OpenCode returned invalid JSON", True) from None
-    if not isinstance(response, dict) or not isinstance(response.get("data"), dict):
-        raise RequestFailure("OpenCode response did not contain a data object", True)
-    answers = response["data"].get("answers")
-    if not isinstance(answers, list):
-        raise RequestFailure("OpenCode response did not contain an answers list", True)
-    return response
+        raise RequestFailure("TypeSafe returned invalid JSON") from None
+    if not isinstance(parsed, dict):
+        raise RequestFailure("TypeSafe returned a non-object response") from None
+    return normalize_typesafe_response(parsed, list(payload["questions"].keys()))
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--allow-paid-fallback",
-        action="store_true",
-        help="retry with paid Jev after a fallbackable Free request failure (requires user approval)",
-    )
     parser.add_argument("--timeout", type=float, default=45.0, help="per-request timeout in seconds")
     args = parser.parse_args()
     if args.timeout <= 0:
         parser.error("--timeout must be greater than zero")
     try:
         payload = json.load(sys.stdin)
-        # Validate/normalize before starting OpenCode or making a model request.
-        to_opencode_request(payload, FREE_MODEL)
+        # Validate before starting any request.
+        to_typesafe_request(payload, TYPESAFE_MODEL)
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as error:
         print(f"Invalid input: {error}", file=sys.stderr)
         return 2
 
-    if args.allow_paid_fallback:
-        models = [FREE_MODEL, PAID_MODEL]
-    else:
-        models = [FREE_MODEL]
-    for index, model_id in enumerate(models):
-        try:
-            response = request_jev(payload, model_id, args.timeout)
-        except RequestFailure as error:
-            can_fallback = index == 0 and len(models) > 1 and error.fallbackable
-            if can_fallback:
-                print(f"{model_id} unavailable ({error}); retrying once with {PAID_MODEL}.", file=sys.stderr)
-                if "HTTP 404" in str(error) or "HTTP 410" in str(error):
-                    print(
-                        "This may indicate retirement; verify the official model list before changing the skill.",
-                        file=sys.stderr,
-                    )
-                continue
-            print(f"Jev request failed for {model_id}: {error}", file=sys.stderr)
-            return 1
+    # Single source: TypeSafe. There is no fallback by design, so failures are reported.
+    key = _typesafe_key()
+    base: dict[str, Any] = {
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "model": TYPESAFE_MODEL,
+        "questions": len(payload["questions"]),
+        "types": _question_types(payload),
+        "state_bytes": len(json.dumps(payload.get("state"), ensure_ascii=False).encode("utf-8")),
+    }
+    if not key:
+        _log_usage({**base, "outcome": "error", "error": "no_key", "elapsed_ms": 0})
+        print(
+            f"Jev unavailable: no TypeSafe key ({TYPESAFE_KEY_ENV} or {TYPESAFE_KEY_FILE}). "
+            "No fallback is configured.",
+            file=sys.stderr,
+        )
+        return 1
 
-        print(f"Jev answered using opencode/{model_id}.", file=sys.stderr)
-        json.dump(response, sys.stdout, ensure_ascii=False)
-        sys.stdout.write("\n")
-        return 0
-    return 1
+    started = time.monotonic()
+    try:
+        response = request_typesafe(payload, TYPESAFE_MODEL, key, args.timeout)
+    except RequestFailure as error:
+        elapsed = int((time.monotonic() - started) * 1000)
+        _log_usage({**base, "outcome": "error", "error": str(error), "elapsed_ms": elapsed})
+        print(
+            f"Jev unavailable: typesafe/{TYPESAFE_MODEL} {error}. No fallback is configured.",
+            file=sys.stderr,
+        )
+        return 1
+
+    elapsed = int((time.monotonic() - started) * 1000)
+    usage = response.get("usage")
+    tokens = usage.get("input_tokens") if isinstance(usage, dict) else None
+    model_used = response.get("model") or TYPESAFE_MODEL
+    _log_usage(
+        {
+            **base,
+            "model": model_used,
+            "outcome": "ok",
+            "input_tokens": tokens,
+            "elapsed_ms": elapsed,
+        }
+    )
+    suffix = f" (input_tokens={tokens})" if isinstance(tokens, int) else ""
+    print(f"Jev answered using typesafe/{model_used}{suffix}.", file=sys.stderr)
+    json.dump(response, sys.stdout, ensure_ascii=False)
+    sys.stdout.write("\n")
+    return 0
 
 
 if __name__ == "__main__":

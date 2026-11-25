@@ -1,8 +1,8 @@
 ---
 name: jev-decision
-description: Use Jev early for bounded, structured decisions in agent workflows: classify, choose among fixed options, score a rubric, prioritize, or judge a yes/no statement. Uses Jev Free only; paid Jev requires explicit user approval. Requires the OpenCode CLI connected to OpenCode Console.
+description: Decide, choose, classify, rank, score, or judge yes/no with Jev before deliberating. Use for 결정, 선택, 분류, 우선순위, 점수, 충족 여부 판단 when the answer changes the next action and the state fits in about 150 words. TypeSafe-only; no fallback source.
 license: MIT
-compatibility: Requires Python 3 and the OpenCode CLI connected via /connect
+compatibility: Requires Python 3 and a TypeSafe API key (no third-party packages)
 metadata:
   author: Junho
   version: "2.0.0"
@@ -13,6 +13,8 @@ allowed-tools:
 # Jev decision skill
 
 Use Jev when an agent needs a small, well-scoped judgment that a typed answer can replace with less reasoning. Jev is a TypeSafe System One decision model, not a chat, summarization, or code-generation model: it returns typed values and probabilities instead of generated text.
+
+Before writing a long deliberation, check two conditions. Call Jev when both hold: (a) the answer changes the next action (a branch, a classification, an accept/reject), and (b) the relevant state fits in roughly 150 words built from the option set and the decisive facts. If unsure whether a case qualifies, call it; a few small calls per session is normal.
 
 ## Good fits
 
@@ -32,7 +34,11 @@ Do not use Jev to generate prose or code, perform open-ended analysis, decide ex
 
 ## Calling Jev
 
-The helper reads a JSON request from stdin with `state` and `questions` fields and calls the OpenCode local API, which reuses your connected OpenCode Console credentials. Do not request, add, or store a separate API key.
+The helper reads a JSON request from stdin with `state` and `questions` fields and calls one source:
+
+**TypeSafe API** (`POST https://api.typesafe.ai/v1/systemone`, model `jev-latest`) when `TYPESAFE_API_KEY` is set in the environment or `~/.config/opencode/jev-decision/typesafe_key` exists. Billed to the user's TypeSafe balance.
+
+There is no fallback source. If the key is missing or the request fails, the helper exits 1 with a reason on stderr (`401/403` key, `402` balance, `429` rate limit, `5xx` service) and prints nothing to stdout. Report the failure and fall back to a conservative answer yourself instead of inventing a Jev result. Use only the user's own TypeSafe key; do not request or store other API keys.
 
 ```sh
 python3 ~/.config/opencode/jev-decision/opencode_decisions.py <<'JSON'
@@ -58,7 +64,7 @@ python3 ~/.config/opencode/jev-decision/opencode_decisions.py <<'JSON'
 JSON
 ```
 
-Requirements: Python 3 and the OpenCode CLI on PATH, connected once with `/connect`. No third-party packages. The helper uses `jev-1.13-free` only and does not retry with paid Jev; pass `--allow-paid-fallback` only when the user has explicitly approved paid cost. The helper writes the response as JSON to stdout and reports the model used to stderr. The CLI carries the state in local process arguments, so keep the state minimal.
+Requirements: Python 3 and a TypeSafe API key. The helper writes the response as JSON to stdout, with `data.answers` in one shape and `source` set to `typesafe`; it reports the model used and TypeSafe input tokens to stderr. It also appends one metadata-only line per call to `~/.local/state/jev/usage.jsonl` (timestamp, model, question count and types, state byte size, input tokens, elapsed ms, outcome). State and question text are never logged.
 
 Note on `noul` wording: write a statement, not a question with a question mark; higher values mean the statement is more likely true.
 
@@ -71,6 +77,12 @@ Note on `noul` wording: write a statement, not a question with a question mark; 
 - Jev advises; your application logic remains responsible for permissions, invariants, confirmations, and final actions. Never use a Jev answer as the sole basis for a high-impact or destructive action.
 - If credentials are missing or the request fails, say Jev was unavailable and use a concise conservative fallback. Do not fabricate a Jev result.
 
-## Maintenance
+## Measuring cost
 
-`jev-1.13-free` is a limited-time model. A single 404, 410, timeout, or rate limit does not prove permanent retirement. If OpenCode's official model catalog confirms the free model ended, read [`docs/FREE_MODEL_RETIREMENT.md`](docs/FREE_MODEL_RETIREMENT.md) and follow it with user approval. Current availability and pricing: https://opencode.ai/v2/docs/console/models
+Each call appends one JSON line to `~/.local/state/jev/usage.jsonl`, for example `input_tokens` and `elapsed_ms`. Aggregate it before claiming any token saving, for example:
+
+```sh
+jq -s 'map(select(.outcome=="ok")) | {calls:length, tokens:(map(.input_tokens // 0)|add), avg_ms:(map(.elapsed_ms)|add/length)}' ~/.local/state/jev/usage.jsonl
+```
+
+A Jev call is only a net token saving when the deliberation it replaces would have been longer than the state sent plus the result round-trip. Measure, do not assume.

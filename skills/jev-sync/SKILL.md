@@ -20,7 +20,7 @@ Repository: `/Users/junho/Repositories/opencode-jev-subagent`
 
 Source files in the repository:
 
-- `skills/jev-decision/` (SKILL.md, scripts/opencode_decisions.py, docs/FREE_MODEL_RETIREMENT.md)
+- `skills/jev-decision/` (SKILL.md, scripts/opencode_decisions.py)
 - `skills/jev-sync/SKILL.md`
 
 Installed mirrors (sync every one that exists):
